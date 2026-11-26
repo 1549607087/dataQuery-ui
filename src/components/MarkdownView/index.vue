@@ -5,6 +5,8 @@
 <script setup lang="ts">
 import { useClipboard } from '@vueuse/core'
 import MarkdownIt from 'markdown-it'
+import katex from 'katex'
+import 'katex/dist/katex.min.css'
 import 'highlight.js/styles/vs2015.min.css'
 import hljs from 'highlight.js'
 
@@ -20,6 +22,117 @@ const message = useMessage() // 消息弹窗
 const { copy } = useClipboard({ legacy: true }) // 初始化 copy 到粘贴板
 const contentRef = ref()
 
+/**
+ * LaTeX 公式插件。markdown-it 默认把 `\[` 的反斜杠当转义符吃掉，
+ * 结果 `\[x=\frac{...}\]` 只剩 `[x=\frac{...}]` 的裸文本。
+ * 这里在 escape 规则之前拦截四种写法，交给本地 KaTeX 渲染：
+ * 块级 `$$...$$` / `\[...\]`，行内 `$...$` / `\(...\)`。
+ */
+const setupKatex = (md: MarkdownIt) => {
+  const render = (tex: string, displayMode: boolean) =>
+    katex.renderToString(tex.trim(), {
+      displayMode,
+      throwOnError: false,
+      strict: false,
+      trust: false
+    })
+
+  md.inline.ruler.before('escape', 'katex_inline', (state, silent) => {
+    const src = state.src
+    const pos = state.pos
+    let open = ''
+    let close = ''
+    let displayMode = false
+    if (src.startsWith('\\[', pos)) {
+      open = '\\['
+      close = '\\]'
+      displayMode = true
+    } else if (src.startsWith('\\(', pos)) {
+      open = '\\('
+      close = '\\)'
+    } else if (src.startsWith('$$', pos)) {
+      open = '$$'
+      close = '$$'
+      displayMode = true
+    } else if (src.startsWith('$', pos)) {
+      // 金额 $100 或单独一个 $ 不当公式
+      if (!src[pos + 1] || src[pos + 1] === '$' || /\s/.test(src[pos + 1])) return false
+      open = '$'
+      close = '$'
+    } else {
+      return false
+    }
+    const start = pos + open.length
+    const end = src.indexOf(close, start)
+    if (end < 0) return false
+    // 行内公式不跨行，跨行的交给块级规则
+    const lineEnd = src.indexOf('\n', start)
+    if (lineEnd >= 0 && end > lineEnd) return false
+    const tex = src.slice(start, end)
+    if (!tex.trim()) return false
+    // 行内 $...$ 必须带数学符号才认，避免「$100 到 $200」这类金额被当成公式
+    if (open === '$' && !/\\[=^_{}+\-*/()]/.test(tex)) return false
+    if (silent) return true
+    const token = state.push('katex_inline', '', 0)
+    token.content = tex
+    token.meta = { displayMode }
+    state.pos = end + close.length
+    return true
+  })
+  md.renderer.rules.katex_inline = (tokens, idx) =>
+    render(tokens[idx].content, !!tokens[idx].meta?.displayMode)
+
+  md.block.ruler.before('fence', 'katex_block', (state, startLine, endLine, silent) => {
+    const begin = state.bMarks[startLine] + state.tShift[startLine]
+    const max = state.eMarks[startLine]
+    const firstLine = state.src.slice(begin, max)
+    let open = ''
+    let close = ''
+    if (firstLine.trimStart().startsWith('$$')) {
+      open = '$$'
+      close = '$$'
+    } else if (firstLine.trimStart().startsWith('\\[')) {
+      open = '\\['
+      close = '\\]'
+    } else {
+      return false
+    }
+    const openPos = begin + firstLine.indexOf(open)
+    const firstContentStart = openPos + open.length
+    const firstRest = state.src.slice(firstContentStart, max)
+    let content = ''
+    let nextLine = startLine
+    const sameLineClose = firstRest.indexOf(close)
+    if (sameLineClose >= 0) {
+      content = firstRest.slice(0, sameLineClose)
+    } else {
+      content = `${firstRest}\n`
+      nextLine = startLine + 1
+      let found = false
+      for (; nextLine < endLine; nextLine++) {
+        const lineBegin = state.bMarks[nextLine] + state.tShift[nextLine]
+        const line = state.src.slice(lineBegin, state.eMarks[nextLine])
+        const closePos = line.indexOf(close)
+        if (closePos >= 0) {
+          content += line.slice(0, closePos)
+          found = true
+          break
+        }
+        content += `${line}\n`
+      }
+      if (!found) return false
+    }
+    if (!content.trim()) return false
+    if (silent) return true
+    const token = state.push('katex_block', '', 0)
+    token.content = content
+    token.map = [startLine, nextLine + 1] as [number, number]
+    state.line = nextLine + 1
+    return true
+  })
+  md.renderer.rules.katex_block = (tokens, idx) => render(tokens[idx].content, true)
+}
+
 const md = new MarkdownIt({
   highlight: function (str, lang) {
     // 语言标记、代码正文和复制内容均来自不可信输入，输出 HTML 前必须转义
@@ -34,6 +147,7 @@ const md = new MarkdownIt({
     return `<pre style="position: relative;">${languageHtml}${copyHtml}<code class="hljs">${codeHtml}</code></pre>`
   }
 })
+setupKatex(md)
 
 /** 渲染 markdown */
 const renderedMarkdown = computed(() => {
@@ -65,6 +179,12 @@ onMounted(async () => {
 
   pre {
     position: relative;
+  }
+
+  /* 长公式横向滚动，不撑破回答卡片 */
+  .katex-display {
+    margin: 12px 0;
+    overflow: auto hidden;
   }
 
   pre code.hljs {
